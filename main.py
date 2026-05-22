@@ -71,8 +71,6 @@ def main() -> int:
     import numpy as np
 
     image = cv2.imdecode(np.fromfile(str(input_path), dtype=np.uint8), cv2.IMREAD_COLOR)
-    .
-    
     if image is None:
         raise FileNotFoundError(
             f"Khong the doc anh dau vao: {input_path}. "
