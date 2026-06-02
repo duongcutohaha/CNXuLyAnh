@@ -22,7 +22,7 @@ pip install ultralytics opencv-python numpy
 
 ```
 project_root/
-├── hello.mp4                      # video đầu vào (hoặc đổi tên khác)
+├── helloo.mp4                      # video đầu vào (hoặc đổi tên khác)
 ├── best_traffic_nano_yolo.pt    # model detect đèn giao thông
 ├── yolov8n.pt                   # model COCO để detect ôtô
 ├── vi_pham/                     # (tự động tạo) lưu ảnh vi phạm
