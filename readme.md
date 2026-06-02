@@ -22,7 +22,7 @@ pip install ultralytics opencv-python numpy
 
 ```
 project_root/
-├── hi2.mp4                      # video đầu vào (hoặc đổi tên khác)
+├── hello.mp4                      # video đầu vào (hoặc đổi tên khác)
 ├── best_traffic_nano_yolo.pt    # model detect đèn giao thông
 ├── yolov8n.pt                   # model COCO để detect ôtô
 ├── vi_pham/                     # (tự động tạo) lưu ảnh vi phạm
@@ -54,7 +54,7 @@ project_root/
 
 ---
 
-*Created by Nguyen Van Nhan*
+*Created by Lê Xuân Dương*
 [![AIoTLab](https://img.shields.io/badge/AIoTLab-green?style=for-the-badge)](https://www.facebook.com/DNUAIoTLab)
 [![Faculty of Information Technology](https://img.shields.io/badge/Faculty%20of%20Information%20Technology-blue?style=for-the-badge)](https://dainam.edu.vn/vi/khoa-cong-nghe-thong-tin)
 [![DaiNam University](https://img.shields.io/badge/DaiNam%20University-orange?style=for-the-badge)](https://dainam.edu.vn)
