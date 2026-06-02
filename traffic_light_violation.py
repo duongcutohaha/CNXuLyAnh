@@ -1,145 +1,260 @@
+from flask import Flask, render_template, Response, jsonify, request
+import cv2
+from ultralytics import YOLO
 import os
 import time
-import cv2
-import numpy as np
-from ultralytics import YOLO
 
-# --- CẤU HÌNH VẼ LINE ---
-line_pts = []
-def mouse_callback(event, x, y, flags, param):
-    global line_pts
-    if event == cv2.EVENT_LBUTTONDOWN and len(line_pts) < 2:
-        line_pts.append((x, y))
-        print(f"Point {len(line_pts)}: {(x,y)}")
+app = Flask(__name__)
 
-VIDEO_SOURCE = r'D:\tptm\Smart-City-and-Smart-Agriculture\Smart_City-Case_study\hi2.mp4'
+VIDEO = "helloo.mp4"
+DETECT_EVERY_N_FRAMES = 3
+STREAM_FPS = 15
+YOLO_IMGSZ = 480
+JPEG_QUALITY = 75
+VEHICLE_CLASSES = [2, 3, 5, 7]
+stop_line = {"x1": 0.05, "y1": 0.65, "x2": 0.95, "y2": 0.65}
 
-# --- CHỌN VẠCH TRÊN FRAME ĐẦU TIÊN ---
-cap = cv2.VideoCapture(VIDEO_SOURCE)
-ret, first_frame = cap.read()
-if not ret:
-    raise RuntimeError("Không thể đọc video.")
-cv2.namedWindow("Select Line")
-cv2.setMouseCallback("Select Line", mouse_callback)
-while True:
-    disp = first_frame.copy()
-    if len(line_pts) >= 1:
-        cv2.circle(disp, line_pts[0], 5, (0,255,0), -1)
-    if len(line_pts) == 2:
-        cv2.line(disp, line_pts[0], line_pts[1], (0,255,0), 2)
-    cv2.imshow("Select Line", disp)
-    key = cv2.waitKey(1) & 0xFF
-    if len(line_pts) == 2 and key == ord('s'):
-        break
-    if key == ord('q'):
-        cap.release(); cv2.destroyAllWindows(); exit("Hủy chọn.")
-cv2.destroyWindow("Select Line")
-cap.release()
+car_model = YOLO("yolov8n.pt")
+tl_model = YOLO("best_traffic_nano_yolo.pt")
 
-# --- TẢI MODEL ---
-car_model = YOLO('yolov8n.pt')              # COCO: class 2 = car
-tl_model  = YOLO('best_traffic_nano_yolo.pt')# 0:red,1:green,2:off,3:yellow
-os.makedirs('vi_pham', exist_ok=True)
+cap = cv2.VideoCapture(VIDEO)
 
-track_history = {}
-frame_count = 0
+paused = False
+frame_lock = None
+last_capture = 0
 
-def side_of_line(pt, p1, p2):
-    x1,y1 = p1; x2,y2 = p2
-    return (x2-x1)*(pt[1]-y1) - (y2-y1)*(pt[0]-x1)
 
-# --- STREAM với TRACKING & LIGHT DETECTION ---
-for result in car_model.track(
-        source=VIDEO_SOURCE,
-        conf=0.5,
-        iou=0.5,
-        classes=[2],
-        persist=True,
-        stream=True
-    ):
-    frame_count += 1
-    frame = result.orig_img.copy()
+def get_stop_line_points(width, height):
+    return (
+        int(stop_line["x1"] * width),
+        int(stop_line["y1"] * height),
+        int(stop_line["x2"] * width),
+        int(stop_line["y2"] * height),
+    )
 
-    # 1) Vẽ vạch
-    cv2.line(frame, line_pts[0], line_pts[1], (0,255,0), 2)
 
-    # 2) Detect đèn giao thông
-    tl_res = tl_model(frame, conf=0.3)[0]
-    tl_state = None
-    for tl_box in tl_res.boxes:
-        x1_l,y1_l,x2_l,y2_l = tl_box.xyxy.cpu().numpy().astype(int)[0]
-        cls_id = int(tl_box.cls.cpu().item())
-        conf_l = float(tl_box.conf.cpu().item())
-        name   = tl_model.model.names[cls_id]
-        color  = (0,255,0) if name=='green' else (0,0,255) if name=='red' else (255,255,0)
-        cv2.rectangle(frame, (x1_l,y1_l),(x2_l,y2_l), color, 2)
-        cv2.putText(frame, f"{name}:{conf_l:.2f}", (x1_l,y1_l-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        if tl_state is None or conf_l > tl_state[1]:
-            tl_state = (name, conf_l)
+def vehicle_crossed_stop_line(box, width, height):
+    x1, y1, x2, y2 = box
+    lx1, ly1, lx2, ly2 = get_stop_line_points(width, height)
 
-    light_label = tl_state[0] if tl_state else "no-light"
-    cv2.putText(frame, f"Light: {light_label}", (10,30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1,
-                (0,255,0) if light_label=='green' else (0,0,255), 2)
+    if lx1 == lx2:
+        return False
 
-    # 3) Xử lý từng xe
-    for box in result.boxes:
-        tid = int(box.id.cpu().item())
-        x1,y1,x2,y2 = box.xyxy.cpu().numpy().astype(int)[0]
-        cx = (x1 + x2)//2
-        cy = y2
+    vehicle_center_x = (x1 + x2) / 2
+    min_line_x = min(lx1, lx2)
+    max_line_x = max(lx1, lx2)
 
-        # Khởi tạo history nếu track mới
-        if tid not in track_history:
-            track_history[tid] = {
-                'pt': (cx,cy),
-                'crossed': False,
-                'violation': False,
-                'violation_time': None
+    if vehicle_center_x < min_line_x or vehicle_center_x > max_line_x:
+        return False
+
+    ratio = (vehicle_center_x - lx1) / (lx2 - lx1)
+    line_y_at_vehicle = ly1 + ratio * (ly2 - ly1)
+
+    return y2 >= line_y_at_vehicle
+
+
+def detect_traffic_light(frame):
+    tl_res = tl_model(frame, conf=0.3, imgsz=YOLO_IMGSZ, verbose=False)[0]
+    light = "none"
+    traffic_boxes = []
+
+    for b in tl_res.boxes:
+        x1, y1, x2, y2 = map(int, b.xyxy[0])
+        cls = int(b.cls[0])
+        light = tl_model.model.names[cls]
+        traffic_boxes.append((x1, y1, x2, y2, light))
+
+    return light, traffic_boxes
+
+
+def detect_vehicles(frame):
+    res = car_model(
+        frame,
+        conf=0.4,
+        imgsz=YOLO_IMGSZ,
+        classes=VEHICLE_CLASSES,
+        verbose=False,
+    )[0]
+    vehicles = []
+
+    for box in res.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cls = int(box.cls[0])
+        name = car_model.model.names[cls]
+        vehicles.append((x1, y1, x2, y2, name))
+
+    return vehicles
+
+
+def generate():
+    global paused, frame_lock, last_capture
+    frame_count = 0
+    light = "none"
+    traffic_boxes = []
+    vehicles = []
+    frame_interval = 1 / STREAM_FPS
+
+    while True:
+        start_time = time.time()
+
+        # ===== READ FRAME =====
+        if not paused:
+            ret, frame = cap.read()
+
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            frame_lock = frame.copy()
+
+        if frame_lock is None:
+            continue
+
+        raw_frame = frame_lock.copy()
+        frame = raw_frame.copy()
+        height, width = frame.shape[:2]
+        line_x1, line_y1, line_x2, line_y2 = get_stop_line_points(width, height)
+
+        if frame_count % DETECT_EVERY_N_FRAMES == 0:
+            light, traffic_boxes = detect_traffic_light(raw_frame)
+            vehicles = detect_vehicles(raw_frame)
+
+        frame_count += 1
+
+        cv2.line(frame, (line_x1, line_y1), (line_x2, line_y2), (255, 255, 255), 3)
+        cv2.putText(frame, "STOP LINE", (line_x1, line_y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # ================= TRAFFIC LIGHT =================
+        for x1, y1, x2, y2, detected_light in traffic_boxes:
+            tl_color = (0, 255, 0)
+            if detected_light == "red":
+                tl_color = (0, 0, 255)
+            elif detected_light == "yellow":
+                tl_color = (0, 255, 255)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), tl_color, 2)
+            cv2.putText(frame, detected_light, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_color, 2)
+
+        cv2.putText(frame, f"Light: {light}", (10,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0,0,255) if light=="red" else (0,255,0), 2)
+
+        # ================= VEHICLE =================
+        has_violation = False
+
+        for x1, y1, x2, y2, name in vehicles:
+            crossed_stop_line = vehicle_crossed_stop_line((x1, y1, x2, y2), width, height)
+
+            color = (0,255,0)
+
+            if name == "motorcycle":
+                color = (255,255,0)
+
+            if light == "red" and crossed_stop_line:
+                color = (0,0,255)
+                has_violation = True
+
+            cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
+            cv2.putText(frame,name,(x1,y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+
+            # ===== CẢNH BÁO ĐÈN ĐỎ (KHÔNG MẤT) =====
+            if light == "red" and crossed_stop_line:
+                cv2.putText(frame,
+                            "CẢNH BÁO ĐÈN ĐỎ",
+                            (x1,y1-30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0,0,255),
+                            2)
+
+        # ===== TỰ ĐỘNG CHỤP VI PHẠM ĐÈN ĐỎ =====
+        if has_violation:
+            current_time = time.time()
+            if current_time - last_capture > 5:
+                os.makedirs("vi_pham", exist_ok=True)
+                filename = f"vi_pham/auto_violation_{int(current_time)}.jpg"
+                cv2.imwrite(filename, frame)
+                last_capture = current_time
+
+        # ================= STREAM =================
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        frame = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+        elapsed = time.time() - start_time
+        if elapsed < frame_interval:
+            time.sleep(frame_interval - elapsed)
+
+
+# ================= ROUTES =================
+
+@app.route('/')
+def index():
+    return render_template("index.html")
+
+
+@app.route('/video')
+def video():
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/line', methods=['GET', 'POST'])
+def line():
+    global stop_line
+
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+
+        try:
+            new_line = {
+                "x1": float(data["x1"]),
+                "y1": float(data["y1"]),
+                "x2": float(data["x2"]),
+                "y2": float(data["y2"]),
             }
-        rec = track_history[tid]
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"status": "error", "message": "invalid line"}), 400
 
-        # Màu box dựa vào flag violation
-        box_color = (0,0,255) if rec['violation'] else (255,0,0)
+        for key, value in new_line.items():
+            new_line[key] = max(0.0, min(1.0, value))
 
-        # Kiểm tra vượt vạch lần đầu
-        if not rec['crossed']:
-            s_prev = side_of_line(rec['pt'], line_pts[0], line_pts[1])
-            s_curr = side_of_line((cx,cy),    line_pts[0], line_pts[1])
-            if s_prev * s_curr < 0:
-                if light_label == 'red':
-                    rec['violation'] = True
-                    rec['violation_time'] = time.time()
-                    # Lưu ảnh vi phạm
-                    crop = result.orig_img[y1:y2, x1:x2]
-                    fname = os.path.join('vi_pham', f"car_{tid}_{frame_count}.jpg")
-                    cv2.imwrite(fname, crop)
-                    print(f"[VI PHAM] Saved {fname}")
-                rec['crossed'] = True
+        stop_line = new_line
+        return jsonify({"status": "saved", "line": stop_line})
 
-        # Cập nhật centroid
-        rec['pt'] = (cx,cy)
+    return jsonify(stop_line)
 
-        # Vẽ box, ID và tâm
-        cv2.rectangle(frame, (x1,y1),(x2,y2), box_color, 2)
-        cv2.putText(frame, f"ID:{tid}", (x1,y1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
-        cv2.circle(frame, (cx,cy), 4, box_color, -1)
 
-        # Hiển thị “VI PHAM” trong 1 giây sau khi vi phạm
-        if rec['violation'] and rec['violation_time'] is not None:
-            if time.time() - rec['violation_time'] <= 1.0:
-                cv2.putText(frame, "VI PHAM", (x1, y1-30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+@app.route('/pause')
+def pause():
+    global paused
+    paused = True
+    return jsonify({"status": "paused"})
 
-    # 4) Hiển thị số lượng xe vi phạm
-    violation_count = sum(1 for v in track_history.values() if v['violation'])
-    cv2.putText(frame, f"Violations: {violation_count}", (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
 
-    cv2.imshow("Tracking & Violation", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+@app.route('/resume')
+def resume():
+    global paused
+    paused = False
+    return jsonify({"status": "running"})
 
-cv2.destroyAllWindows()
+
+@app.route('/capture')
+def capture():
+    if frame_lock is not None:
+        os.makedirs("vi_pham", exist_ok=True)
+        filename = f"vi_pham/capture_{int(time.time())}.jpg"
+        cv2.imwrite(filename, frame_lock)
+        return jsonify({"status": "saved", "file": filename})
+    return jsonify({"status": "no frame"})
+
+
+if __name__ == "__main__":
+    os.makedirs("vi_pham", exist_ok=True)
+    print("RUN http://127.0.0.1:5000")
+    app.run(debug=False, threaded=True)
